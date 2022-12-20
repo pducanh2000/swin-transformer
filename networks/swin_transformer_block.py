@@ -111,6 +111,7 @@ class WindowAttention(nn.Module):
 
         # In case masked multi-head attention
         if mask is not None:
+            # attn_mask is shape of (num_win, window_size * window_size, window_size * window_size)
             num_win = mask.shape[0]
             attn = attn.view(B_ // num_win, num_win, self.num_heads, N, N) + mask.unsqueeze(1).unsqueeze(0)
             attn = attn.view(-1, self.num_heads, N, N)      # (B, num_heads, N, N)
@@ -123,8 +124,8 @@ class WindowAttention(nn.Module):
         attn = attn @ v   # (B_, num_heads, N, head_dim)
         attn = attn.transpose(1, 2).reshape(B_, N, -1)      # (B_, N, num_head * head_dims=attn_dim)
 
-        attn = self.proj(attn)
-        attn = self.proj_drop(attn)
+        attn = self.proj(attn)              # (B_, N, dim)
+        attn = self.proj_drop(attn)         # (B_, N, dim)
         return attn
 
 
@@ -137,7 +138,7 @@ class SwinTransformerBlock(nn.Module):
         self.input_resolution = input_resolution
         self.window_size = window_size
         self.mlp_ratio = mlp_ratio
-        self.shif_size = shift_size
+        self.shift_size = shift_size
 
         if min(input_resolution) <= self.window_size:
             # if the input_resolution is smaller than the window size, we do not need to partition to windows
@@ -174,6 +175,7 @@ class SwinTransformerBlock(nn.Module):
             mask_windows = window_partition(img_mask, self.window_size)  # num_win, window_size, window_size, 1
             mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
             attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            # attn_mask is shape of (num_win, window_size * window_size, window_size * window_size)
             attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
         else:
             attn_mask = None

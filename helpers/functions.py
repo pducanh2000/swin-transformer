@@ -42,6 +42,7 @@ def get_relative_position_index(win_h, win_w):
     relative_coords = coords_flatten[:, None, :] - coords_flatten[:, :, None]      # (2, win_h * win_w, win_h * win_w)
     # print(relative_coords)
     relative_coords = relative_coords.permute(1, 2, 0).contiguous()         # ( win_h * win_w, win_h * win_w, 2)
+    # print(relative_coords)
 
     relative_coords[:, :, 0] += win_h - 1  # shift to start from 0
     relative_coords[:, :, 1] += win_w - 1
@@ -113,8 +114,8 @@ def checkpoint_seq(
     Returns:
         Output of running :attr:`functions` sequentially on :attr:`*inputs`
     Example:
-        >>> model = nn.Sequential(...)
-        >>> input_var = checkpoint_seq(model, input_var, every=2)
+        # >>> model = nn.Sequential(...)
+        # >>> input_var = checkpoint_seq(model, input_var, every=2)
     """
     def run_function(start, end, functions):
         def forward(_x):
