@@ -1,8 +1,47 @@
 import torch
 import torch.nn as nn
 
-from helpers.functions import to_ntuple, get_relative_position_index
+from helpers.functions import to_ntuple, get_relative_position_index, drop_path, window_partition, window_reverse
 from helpers.weight_init import trunc_normal_
+
+
+class DropPath(nn.Module):
+    def __init__(self, drop_prob: float = 0., scale_by_keep: bool = True):
+        super(DropPath, self).__init__()
+        self.drop_prob = drop_prob
+        self.scale_by_keep = scale_by_keep
+
+    def forward(self, x):
+        return drop_path(x, self.drop_prob, self.training, self.scale_by_keep)
+
+    def extra_repr(self):
+        return f'drop_prob={round(self.drop_prob, 3):0.3f}'
+
+
+class Mlp(nn.Module):
+    """ MLP as used in Vision Transformer, MLP-Mixer and related networks
+    """
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, bias=True, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        to_2tuple = to_ntuple(2)
+        bias = to_2tuple(bias)
+        drop_probs = to_2tuple(drop)
+
+        self.fc1 = nn.Linear(in_features, hidden_features, bias=bias[0])
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop_probs[0])
+        self.fc2 = nn.Linear(hidden_features, out_features, bias=bias[1])
+        self.drop2 = nn.Dropout(drop_probs[1])
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
 
 
 class WindowAttention(nn.Module):
@@ -63,7 +102,7 @@ class WindowAttention(nn.Module):
         B_, N, C = x.shape  # C = self.dim
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1)     # (B_, N, 3, num_heads, attn_dim//num_heads)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B_, num_heads, N, attn_dim//num_heads)
-        q, k, v = qkv.unbind(0)  # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv.unbind(0)  # make torch script happy (cannot use tensor as tuple)
 
         # attn_score  = softmax(Q.Kt) / sqrt(d_k)
         q = q * self.scale
@@ -90,4 +129,95 @@ class WindowAttention(nn.Module):
 
 
 class SwinTransformerBlock(nn.Module):
-    def __init__(self, ):
+    def __init__(self, dim, input_resolution, num_heads=4, head_dims=None, window_size=7, shift_size=0,
+                 mlp_ratio=4., qkv_bias=True, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU,
+                 norm_layer=nn.LayerNorm):
+        super(SwinTransformerBlock, self).__init__()
+        self.dim = dim
+        self.input_resolution = input_resolution
+        self.window_size = window_size
+        self.mlp_ratio = mlp_ratio
+        self.shif_size = shift_size
+
+        if min(input_resolution) <= self.window_size:
+            # if the input_resolution is smaller than the window size, we do not need to partition to windows
+            self.shift_size = 0
+            self.window_size = min(input_resolution)
+
+        assert 0 <= self.shift_size < self.window_size  # shift size should be in the range of [0, window_size)
+
+        self.norm1 = norm_layer(dim)
+        to_2tuple = to_ntuple(2)
+        self.attn = WindowAttention(dim=dim, num_heads=num_heads, head_dim=head_dims,
+                                    window_size=to_2tuple(window_size), qkv_bias=qkv_bias, attn_drop=attn_drop,
+                                    proj_drop=drop)
+        self.drop_path = DropPath(drop_prob=drop_path)
+        self.norm2 = norm_layer(dim)
+
+        self.mlp = Mlp(in_features=dim, hidden_features=(dim * mlp_ratio), act_layer=act_layer, drop=drop)
+
+        if self.shift_size > 0:
+            # calculate attention mask for SW-MSA
+            H, W = self.input_resolution
+            img_mask = torch.zeros((1, H, W, 1))  # 1 H W 1
+            cnt = 0
+            for h in (
+                    slice(0, -self.window_size),
+                    slice(-self.window_size, -self.shift_size),
+                    slice(-self.shift_size, None)):
+                for w in (
+                        slice(0, -self.window_size),
+                        slice(-self.window_size, -self.shift_size),
+                        slice(-self.shift_size, None)):
+                    img_mask[:, h, w, :] = cnt
+                    cnt += 1
+            mask_windows = window_partition(img_mask, self.window_size)  # num_win, window_size, window_size, 1
+            mask_windows = mask_windows.view(-1, self.window_size * self.window_size)
+            attn_mask = mask_windows.unsqueeze(1) - mask_windows.unsqueeze(2)
+            attn_mask = attn_mask.masked_fill(attn_mask != 0, float(-100.0)).masked_fill(attn_mask == 0, float(0.0))
+        else:
+            attn_mask = None
+
+        self.register_buffer("attn_mask", attn_mask)
+
+    def forward(self, x):
+        H, W = self.input_resolution
+        B, L, C = x.shape
+        assert(L == H * W, "input feature has wrong size")
+
+        shortcut = x
+        x = self.norm1(x)
+        x = x.view(B, H, W, C)
+
+        # cyclic shift
+        if self.shift_size > 0:
+            shifted_x = torch.roll(x, shifts=(-self.shift_size, -self.shift_size), dims=(1, 2))
+        else:
+            shifted_x = x
+
+        # partition windows
+        x_windows = window_partition(shifted_x, self.window_size)  # num_win*B, window_size, window_size, C
+        x_windows = x_windows.view(-1, self.window_size * self.window_size,
+                                   C)  # num_win*B, window_size*window_size, C
+
+        # W-MSA/SW-MSA
+        attn_windows = self.attn(x_windows, mask=self.attn_mask)  # num_win*B, window_size*window_size, C
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, self.window_size, self.window_size, C)
+        shifted_x = window_reverse(attn_windows, self.window_size, H, W)  # B H' W' C
+
+        # reverse cyclic shift
+        if self.shift_size > 0:
+            x = torch.roll(shifted_x, shifts=(self.shift_size, self.shift_size), dims=(1, 2))
+        else:
+            x = shifted_x
+        x = x.view(B, H * W, C)
+
+        # FFN
+        x = shortcut + self.drop_path(x)
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+        return x
+
+
