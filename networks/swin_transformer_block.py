@@ -99,7 +99,7 @@ class WindowAttention(nn.Module):
             x: input features with shape of (num_windows*B, N, C)
             mask: (0/-inf) mask with shape of (num_windows, Wh*Ww, Wh*Ww) or None
         """
-        B_, N, C = x.shape  # C = self.dim
+        B_, N, C = x.shape  # C = self.dim, N = window_size * window_size
         qkv = self.qkv(x).reshape(B_, N, 3, self.num_heads, -1)     # (B_, N, 3, num_heads, attn_dim//num_heads)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B_, num_heads, N, attn_dim//num_heads)
         q, k, v = qkv.unbind(0)  # make torch script happy (cannot use tensor as tuple)
